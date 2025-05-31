@@ -1,0 +1,14 @@
+{{- range $app, $values := dict "nodejs" .Values.nodejsApp "python" .Values.pythonApp "php" .Values.phpApp }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $app }}-service
+spec:
+  selector:
+    app: {{ $app }}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: {{ $values.port }}
+---
+{{- end }}

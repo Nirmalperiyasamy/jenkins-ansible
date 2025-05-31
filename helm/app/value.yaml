@@ -1,0 +1,15 @@
+nodejsApp:
+  image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/nodejs-app:latest
+  port: 3000
+
+pythonApp:
+  image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/python-app:latest
+  port: 5000
+
+phpApp:
+  image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/php-app:latest
+  port: 80
+
+ingress:
+  enabled: true
+  host: my-app.local

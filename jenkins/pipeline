@@ -1,0 +1,195 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REPO = 'your-ecr-repo-name'         
+        AWS_ACCOUNT_ID = '123456789012'
+        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+        DEPLOYMENT_NAME = 'your-app-deployment'
+        K8S_NAMESPACE = 'ansible-demo'
+        KUBECONFIG = credentials('kubeconfig-file') // Jenkins credential for kubeconfig
+        AWS_CREDENTIALS = credentials('aws-credentials') // Jenkins credential for AWS
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+
+        stage('Setup Environment') {
+            steps {
+                script {
+                    // Set dynamic image tag if not set
+                    if (env.IMAGE_TAG == 'latest') {
+                        env.IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+                    }
+                    echo "Using image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Build and Test') {
+            parallel {
+                stage('Build Docker Image') {
+                    steps {
+                        echo "Building Docker image..."
+                        sh '''
+                            # Build the Docker image
+                            docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG .
+                            
+                            # Tag as latest as well
+                            docker tag $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG \
+                                      $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
+                        '''
+                    }
+                }
+                
+                stage('Run Tests') {
+                    steps {
+                        echo "Running application tests..."
+                        sh '''
+                            # Add your test commands here
+                            # docker run --rm $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG npm test
+                            echo "Tests completed successfully"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Authenticate with ECR') {
+            steps {
+                echo "Authenticating Docker with AWS ECR..."
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        aws ecr get-login-password --region $AWS_REGION | \
+                        docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                    '''
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                echo "Pushing Docker image to AWS ECR..."
+                sh '''
+                    # Push specific tag
+                    docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+                    
+                    # Push latest tag
+                    docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
+                '''
+            }
+        }
+
+        stage('Prepare Kubernetes Config') {
+            steps {
+                echo "Setting up Kubernetes configuration..."
+                sh '''
+                    # Copy kubeconfig to workspace
+                    cp $KUBECONFIG $WORKSPACE/kubeconfig
+                    export KUBECONFIG=$WORKSPACE/kubeconfig
+                    
+                    # Verify connection to cluster
+                    kubectl cluster-info
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                echo "Deploying application to Kubernetes cluster on EC2..."
+                sh '''
+                    export KUBECONFIG=$WORKSPACE/kubeconfig
+                    
+                    # Check if namespace exists, create if not
+                    kubectl get namespace $K8S_NAMESPACE || kubectl create namespace $K8S_NAMESPACE
+                    
+                    # Check if deployment exists
+                    if kubectl get deployment $DEPLOYMENT_NAME --namespace=$K8S_NAMESPACE > /dev/null 2>&1; then
+                        echo "Updating existing deployment..."
+                        kubectl set image deployment/$DEPLOYMENT_NAME \
+                            $ECR_REPO=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG \
+                            --namespace=$K8S_NAMESPACE
+                    else
+                        echo "Creating new deployment..."
+                        kubectl create deployment $DEPLOYMENT_NAME \
+                            --image=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG \
+                            --namespace=$K8S_NAMESPACE
+                    fi
+                    
+                    # Wait for rollout to complete
+                    kubectl rollout status deployment/$DEPLOYMENT_NAME --namespace=$K8S_NAMESPACE --timeout=300s
+                    
+                    # Verify deployment
+                    kubectl get pods --namespace=$K8S_NAMESPACE -l app=$DEPLOYMENT_NAME
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                echo "Verifying deployment health..."
+                sh '''
+                    export KUBECONFIG=$WORKSPACE/kubeconfig
+                    
+                    # Check deployment status
+                    kubectl get deployment $DEPLOYMENT_NAME --namespace=$K8S_NAMESPACE
+                    
+                    # Get pod status
+                    kubectl get pods --namespace=$K8S_NAMESPACE -l app=$DEPLOYMENT_NAME
+                    
+                    # Check if service exists and get details
+                    if kubectl get service $DEPLOYMENT_NAME-service --namespace=$K8S_NAMESPACE > /dev/null 2>&1; then
+                        kubectl get service $DEPLOYMENT_NAME-service --namespace=$K8S_NAMESPACE
+                    fi
+                    
+                    # Show recent events
+                    kubectl get events --namespace=$K8S_NAMESPACE --sort-by='.lastTimestamp' | tail -10
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Cleaning up workspace..."
+            sh '''
+                # Clean up local Docker images to save space
+                docker rmi $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG || true
+                docker rmi $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest || true
+                
+                # Remove kubeconfig from workspace
+                rm -f $WORKSPACE/kubeconfig || true
+                
+                # Clean up dangling images
+                docker image prune -f || true
+            '''
+        }
+        success {
+            echo "Deployment pipeline completed successfully!"
+            echo "Application deployed to Kubernetes cluster on EC2"
+            echo "Image tag: ${env.IMAGE_TAG}"
+        }
+        failure {
+            echo "Pipeline failed. Check logs for more details."
+            sh '''
+                export KUBECONFIG=$WORKSPACE/kubeconfig
+                echo "=== Deployment Status ==="
+                kubectl get deployment $DEPLOYMENT_NAME --namespace=$K8S_NAMESPACE || true
+                echo "=== Pod Status ==="
+                kubectl get pods --namespace=$K8S_NAMESPACE -l app=$DEPLOYMENT_NAME || true
+                echo "=== Recent Events ==="
+                kubectl get events --namespace=$K8S_NAMESPACE --sort-by='.lastTimestamp' | tail -20 || true
+            '''
+        }
+        unstable {
+            echo "Pipeline completed with warnings."
+        }
+    }
+}

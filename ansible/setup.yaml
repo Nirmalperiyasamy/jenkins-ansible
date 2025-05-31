@@ -1,0 +1,410 @@
+---
+- name: Setup EC2 with Jenkins, Docker, Kubernetes tools and deploy Jenkins on K8s
+  hosts: web
+  become: yes
+  vars:
+    kubernetes_version: "1.30"
+    containerd_version: "1.7.2"
+
+  tasks:
+    - name: Update packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+        cache_valid_time: 3600
+
+    - name: Install basic dependencies
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - lsb-release
+          - wget
+        state: present
+
+    - name: Disable swap permanently
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+      register: swap_result
+      changed_when: swap_result.rc == 0
+
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Make kernel modules persistent
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Set kernel parameters for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+      register: sysctl_config
+
+    - name: Apply sysctl params
+      shell: sysctl --system
+      when: sysctl_config.changed
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default containerd configuration
+      shell: containerd config default | tee /etc/containerd/config.toml >/dev/null
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroup driver
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*SystemdCgroup\s*='
+        line: '            SystemdCgroup = true'
+        backup: yes
+      notify: restart containerd
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Update apt cache after adding K8s repo
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Initialize Kubernetes cluster
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+      register: kubeadm_init
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Create .kube directory for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to ubuntu user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+        remote_src: yes
+
+    - name: Install Calico network plugin
+      become_user: ubuntu
+      shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: calico_install
+      when: not k8s_admin_conf.stat.exists or kubeadm_init.changed
+
+    - name: Remove master taint to allow scheduling on control plane
+      become_user: ubuntu
+      shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+
+    - name: Wait for all nodes to be ready
+      become_user: ubuntu
+      shell: kubectl get nodes --no-headers | grep -v Ready || true
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: nodes_not_ready
+      until: nodes_not_ready.stdout == ""
+      retries: 20
+      delay: 30
+
+    - name: Wait for all system pods to be ready
+      become_user: ubuntu
+      shell: kubectl get pods -n kube-system --no-headers | grep -v Running | grep -v Completed || true
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      register: pods_not_ready
+      until: pods_not_ready.stdout == ""
+      retries: 20
+      delay: 15
+
+  handlers:
+    - name: restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+- name: Deploy Jenkins to Kubernetes
+  hosts: web
+  become: no
+  vars:
+    jenkins_namespace: default
+    jenkins_image: jenkins/jenkins:lts  # Change this to your ECR image if needed
+
+  tasks:
+    - name: Create Jenkins namespace (if not default)
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        name: "{{ jenkins_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      when: jenkins_namespace != "default"
+
+    - name: Create Jenkins PVC for persistent storage
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: jenkins-pvc
+            namespace: "{{ jenkins_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+
+    - name: Deploy Jenkins
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: jenkins
+            namespace: "{{ jenkins_namespace }}"
+            labels:
+              app: jenkins
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: jenkins
+            template:
+              metadata:
+                labels:
+                  app: jenkins
+              spec:
+                securityContext:
+                  fsGroup: 1000
+                containers:
+                  - name: jenkins
+                    image: "{{ jenkins_image }}"
+                    ports:
+                      - containerPort: 8080
+                        name: http
+                      - containerPort: 50000
+                        name: agent
+                    env:
+                      - name: JAVA_OPTS
+                        value: "-Djenkins.install.runSetupWizard=false"
+                    volumeMounts:
+                      - name: jenkins-data
+                        mountPath: /var/jenkins_home
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2Gi"
+                        cpu: "1000m"
+                    livenessProbe:
+                      httpGet:
+                        path: /login
+                        port: 8080
+                      initialDelaySeconds: 90
+                      periodSeconds: 30
+                    readinessProbe:
+                      httpGet:
+                        path: /login
+                        port: 8080
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                volumes:
+                  - name: jenkins-data
+                    persistentVolumeClaim:
+                      claimName: jenkins-pvc
+
+    - name: Create Jenkins Service
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: jenkins-service
+            namespace: "{{ jenkins_namespace }}"
+            labels:
+              app: jenkins
+          spec:
+            type: ClusterIP
+            selector:
+              app: jenkins
+            ports:
+              - name: http
+                port: 8080
+                targetPort: 8080
+              - name: agent
+                port: 50000
+                targetPort: 50000
+
+    - name: Create Jenkins NodePort Service (for direct access)
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: jenkins-nodeport
+            namespace: "{{ jenkins_namespace }}"
+            labels:
+              app: jenkins
+          spec:
+            type: NodePort
+            selector:
+              app: jenkins
+            ports:
+              - name: http
+                port: 8080
+                targetPort: 8080
+                nodePort: 30808
+
+    - name: Create Jenkins Ingress
+      kubernetes.core.k8s:
+        kubeconfig: /home/ubuntu/.kube/config
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: jenkins-ingress
+            namespace: "{{ jenkins_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+          spec:
+            rules:
+              - host: jenkins.example.com  # Change this to your domain
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: jenkins-service
+                          port:
+                            number: 8080
+
+    - name: Wait for Jenkins deployment to be ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /home/ubuntu/.kube/config
+        api_version: apps/v1
+        kind: Deployment
+        name: jenkins
+        namespace: "{{ jenkins_namespace }}"
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Get Jenkins pod name
+      kubernetes.core.k8s_info:
+        kubeconfig: /home/ubuntu/.kube/config
+        api_version: v1
+        kind: Pod
+        namespace: "{{ jenkins_namespace }}"
+        label_selectors:
+          - app=jenkins
+      register: jenkins_pods
+
+    - name: Display Jenkins access information
+      debug:
+        msg:
+          - "Jenkins deployment completed successfully!"
+          - "Access Jenkins at:"
+          - "  - Direct NodePort: http://{{ ansible_default_ipv4.address }}:30808"
+          - "  - Via kubectl port-forward: kubectl port-forward svc/jenkins-service 8080:8080"
+          - "  - Ingress (if configured): http://jenkins.example.com"
+          - ""
+          - "To get the initial admin password, run:"
+          - "kubectl exec {{ jenkins_pods.resources[0].metadata.name }} -- cat /var/jenkins_home/secrets/initialAdminPassword"
+          - ""
+          - "SSH to server: ssh -i ~/.ssh/{{ ansible_ssh_private_key_file | basename | regex_replace('.pem$', '') }}.pem ubuntu@{{ ansible_default_ipv4.address }}"

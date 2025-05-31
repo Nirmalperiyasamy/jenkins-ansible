@@ -1,0 +1,34 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /node
+            pathType: Prefix
+            backend:
+              service:
+                name: nodejs-service
+                port:
+                  number: 80
+          - path: /python
+            pathType: Prefix
+            backend:
+              service:
+                name: python-service
+                port:
+                  number: 80
+          - path: /php
+            pathType: Prefix
+            backend:
+              service:
+                name: php-service
+                port:
+                  number: 80
+{{- end }}
